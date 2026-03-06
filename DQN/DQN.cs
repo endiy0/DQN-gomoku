@@ -4,46 +4,54 @@ namespace DQN
 {
     public sealed class DQN
     {
-        public const int InputSize = OmokEnvironment.ActionCount + 1;
-        public const int OutputSize = OmokEnvironment.ActionCount;
+        private const int BoardSize = OmokEnvironment.BoardSize;
+        private const int BoardArea = BoardSize * BoardSize;
+        private const int InputChannels = 4;
+        private const int KernelSize = 3;
+        private const int Padding = 1;
 
-        private readonly int hiddenSize;
-        private readonly float[] w1;
-        private readonly float[] b1;
-        private readonly float[] w2;
-        private readonly float[] b2;
+        public const int InputSize = BoardArea + 1;
+        public const int OutputSize = BoardArea;
 
-        public int HiddenSize => hiddenSize;
+        private readonly int filterCount;
+        private readonly float[] convW;
+        private readonly float[] convB;
+        private readonly float[] outW;
+        private readonly float[] outB;
 
-        public DQN(int hiddenSize = 128, int? seed = null)
+        public int HiddenSize => filterCount;
+
+        public DQN(int hiddenSize = 16, int? seed = null)
         {
-            this.hiddenSize = hiddenSize;
-
-            w1 = new float[InputSize * hiddenSize];
-            b1 = new float[hiddenSize];
-            w2 = new float[hiddenSize * OutputSize];
-            b2 = new float[OutputSize];
+            filterCount = Math.Max(4, hiddenSize);
+            convW = new float[filterCount * InputChannels * KernelSize * KernelSize];
+            convB = new float[filterCount];
+            outW = new float[filterCount * BoardArea * OutputSize];
+            outB = new float[OutputSize];
 
             var random = seed.HasValue ? new Random(seed.Value) : new Random();
             InitializeWeights(random);
         }
 
-        private DQN(int hiddenSize, float[] w1, float[] b1, float[] w2, float[] b2)
+        private DQN(int filterCount, float[] convW, float[] convB, float[] outW, float[] outB)
         {
-            this.hiddenSize = hiddenSize;
-            this.w1 = w1;
-            this.b1 = b1;
-            this.w2 = w2;
-            this.b2 = b2;
+            this.filterCount = filterCount;
+            this.convW = convW;
+            this.convB = convB;
+            this.outW = outW;
+            this.outB = outB;
         }
 
         public float[] Predict(float[] state)
         {
             ValidateState(state);
-            var hiddenPre = new float[hiddenSize];
-            var hiddenAct = new float[hiddenSize];
+            int featureSize = filterCount * BoardArea;
+            var tensor = new float[InputChannels * BoardArea];
+            var convPre = new float[featureSize];
+            var convAct = new float[featureSize];
             var output = new float[OutputSize];
-            Forward(state, hiddenPre, hiddenAct, output);
+
+            Forward(state, tensor, convPre, convAct, output);
             return output;
         }
 
@@ -95,16 +103,20 @@ namespace DQN
                 throw new ArgumentOutOfRangeException(nameof(action), "유효하지 않은 액션 인덱스입니다.");
             }
 
-            var hiddenPre = new float[hiddenSize];
-            var hiddenAct = new float[hiddenSize];
+            int featureSize = filterCount * BoardArea;
+            var tensor = new float[InputChannels * BoardArea];
+            var convPre = new float[featureSize];
+            var convAct = new float[featureSize];
             var qValues = new float[OutputSize];
-            Forward(state, hiddenPre, hiddenAct, qValues);
+
+            Forward(state, tensor, convPre, convAct, qValues);
 
             float target = reward;
             if (!done && nextLegalActions.Count > 0)
             {
                 float[] nextQ = Predict(nextState);
                 float maxNext = float.NegativeInfinity;
+
                 for (int i = 0; i < nextLegalActions.Count; i++)
                 {
                     float q = nextQ[nextLegalActions[i]];
@@ -118,71 +130,110 @@ namespace DQN
             }
 
             float tdError = Math.Clamp(qValues[action] - target, -10f, 10f);
-            var oldW2Column = new float[hiddenSize];
-            for (int h = 0; h < hiddenSize; h++)
+            var oldOutColumn = new float[featureSize];
+
+            for (int i = 0; i < featureSize; i++)
             {
-                oldW2Column[h] = w2[W2Index(h, action)];
+                int idx = OutWIndex(i, action);
+                oldOutColumn[i] = outW[idx];
+                float grad = tdError * convAct[i];
+                outW[idx] -= learningRate * grad;
             }
 
-            for (int h = 0; h < hiddenSize; h++)
+            outB[action] -= learningRate * tdError;
+
+            var convGradW = new float[convW.Length];
+            var convGradB = new float[convB.Length];
+
+            for (int f = 0; f < filterCount; f++)
             {
-                int idx = W2Index(h, action);
-                float grad = tdError * hiddenAct[h];
-                w2[idx] -= learningRate * grad;
+                for (int y = 0; y < BoardSize; y++)
+                {
+                    for (int x = 0; x < BoardSize; x++)
+                    {
+                        int featureIndex = FeatureIndex(f, y, x);
+                        if (convPre[featureIndex] <= 0f)
+                        {
+                            continue;
+                        }
+
+                        float dPre = tdError * oldOutColumn[featureIndex];
+                        if (dPre == 0f)
+                        {
+                            continue;
+                        }
+
+                        convGradB[f] += dPre;
+
+                        for (int c = 0; c < InputChannels; c++)
+                        {
+                            for (int ky = 0; ky < KernelSize; ky++)
+                            {
+                                int iy = y + ky - Padding;
+                                if (iy < 0 || iy >= BoardSize)
+                                {
+                                    continue;
+                                }
+
+                                for (int kx = 0; kx < KernelSize; kx++)
+                                {
+                                    int ix = x + kx - Padding;
+                                    if (ix < 0 || ix >= BoardSize)
+                                    {
+                                        continue;
+                                    }
+
+                                    float inputValue = tensor[TensorIndex(c, iy, ix)];
+                                    int wIdx = ConvWIndex(f, c, ky, kx);
+                                    convGradW[wIdx] += dPre * inputValue;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            b2[action] -= learningRate * tdError;
 
-            for (int h = 0; h < hiddenSize; h++)
+            for (int i = 0; i < convW.Length; i++)
             {
-                if (hiddenPre[h] <= 0f)
-                {
-                    continue;
-                }
+                convW[i] -= learningRate * convGradW[i];
+            }
 
-                float hiddenGrad = tdError * oldW2Column[h];
-                int w1ColOffset = h;
-
-                for (int i = 0; i < InputSize; i++)
-                {
-                    int idx = W1Index(i, w1ColOffset);
-                    float grad = hiddenGrad * state[i];
-                    w1[idx] -= learningRate * grad;
-                }
-
-                b1[h] -= learningRate * hiddenGrad;
+            for (int i = 0; i < convB.Length; i++)
+            {
+                convB[i] -= learningRate * convGradB[i];
             }
         }
 
         public DQN Clone()
         {
             return new DQN(
-                hiddenSize,
-                (float[])w1.Clone(),
-                (float[])b1.Clone(),
-                (float[])w2.Clone(),
-                (float[])b2.Clone());
+                filterCount,
+                (float[])convW.Clone(),
+                (float[])convB.Clone(),
+                (float[])outW.Clone(),
+                (float[])outB.Clone());
         }
 
         public void Mutate(float scale, Random random)
         {
-            for (int i = 0; i < w1.Length; i++)
+            for (int i = 0; i < convW.Length; i++)
             {
-                w1[i] += NextGaussian(random) * scale;
+                convW[i] += NextGaussian(random) * scale;
             }
 
-            for (int i = 0; i < b1.Length; i++)
+            for (int i = 0; i < convB.Length; i++)
             {
-                b1[i] += NextGaussian(random) * scale;
+                convB[i] += NextGaussian(random) * scale;
             }
 
-            for (int i = 0; i < w2.Length; i++)
+            for (int i = 0; i < outW.Length; i++)
             {
-                w2[i] += NextGaussian(random) * scale;
+                outW[i] += NextGaussian(random) * scale;
             }
 
-            for (int i = 0; i < b2.Length; i++)
+            for (int i = 0; i < outB.Length; i++)
             {
-                b2[i] += NextGaussian(random) * scale;
+                outB[i] += NextGaussian(random) * scale;
             }
         }
 
@@ -196,11 +247,12 @@ namespace DQN
 
             var snapshot = new DqnSnapshot
             {
-                HiddenSize = hiddenSize,
-                W1 = w1,
-                B1 = b1,
-                W2 = w2,
-                B2 = b2
+                Version = 2,
+                FilterCount = filterCount,
+                ConvW = convW,
+                ConvB = convB,
+                OutW = outW,
+                OutB = outB
             };
 
             string json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true });
@@ -216,53 +268,138 @@ namespace DQN
                 throw new InvalidOperationException("모델 파일을 읽을 수 없습니다.");
             }
 
-            int hidden = snapshot.HiddenSize;
-            if (snapshot.W1 is null || snapshot.B1 is null || snapshot.W2 is null || snapshot.B2 is null)
+            if (snapshot.ConvW is null || snapshot.ConvB is null || snapshot.OutW is null || snapshot.OutB is null)
             {
-                throw new InvalidOperationException("모델 파일 형식이 잘못되었습니다.");
+                throw new InvalidOperationException("CNN DQN 형식이 아닌 모델 파일입니다.");
             }
 
-            if (snapshot.W1.Length != InputSize * hidden)
+            int filters = snapshot.FilterCount;
+            int expectedConvW = filters * InputChannels * KernelSize * KernelSize;
+            int expectedOutW = filters * BoardArea * OutputSize;
+
+            if (snapshot.ConvW.Length != expectedConvW)
             {
-                throw new InvalidOperationException("W1 크기가 올바르지 않습니다.");
+                throw new InvalidOperationException("ConvW 크기가 올바르지 않습니다.");
             }
 
-            if (snapshot.B1.Length != hidden)
+            if (snapshot.ConvB.Length != filters)
             {
-                throw new InvalidOperationException("B1 크기가 올바르지 않습니다.");
+                throw new InvalidOperationException("ConvB 크기가 올바르지 않습니다.");
             }
 
-            if (snapshot.W2.Length != hidden * OutputSize)
+            if (snapshot.OutW.Length != expectedOutW)
             {
-                throw new InvalidOperationException("W2 크기가 올바르지 않습니다.");
+                throw new InvalidOperationException("OutW 크기가 올바르지 않습니다.");
             }
 
-            if (snapshot.B2.Length != OutputSize)
+            if (snapshot.OutB.Length != OutputSize)
             {
-                throw new InvalidOperationException("B2 크기가 올바르지 않습니다.");
+                throw new InvalidOperationException("OutB 크기가 올바르지 않습니다.");
             }
 
             return new DQN(
-                hidden,
-                (float[])snapshot.W1.Clone(),
-                (float[])snapshot.B1.Clone(),
-                (float[])snapshot.W2.Clone(),
-                (float[])snapshot.B2.Clone());
+                filters,
+                (float[])snapshot.ConvW.Clone(),
+                (float[])snapshot.ConvB.Clone(),
+                (float[])snapshot.OutW.Clone(),
+                (float[])snapshot.OutB.Clone());
+        }
+
+        private void Forward(float[] state, float[] tensor, float[] convPre, float[] convAct, float[] output)
+        {
+            StateToTensor(state, tensor);
+
+            for (int f = 0; f < filterCount; f++)
+            {
+                for (int y = 0; y < BoardSize; y++)
+                {
+                    for (int x = 0; x < BoardSize; x++)
+                    {
+                        float sum = convB[f];
+
+                        for (int c = 0; c < InputChannels; c++)
+                        {
+                            for (int ky = 0; ky < KernelSize; ky++)
+                            {
+                                int iy = y + ky - Padding;
+                                if (iy < 0 || iy >= BoardSize)
+                                {
+                                    continue;
+                                }
+
+                                for (int kx = 0; kx < KernelSize; kx++)
+                                {
+                                    int ix = x + kx - Padding;
+                                    if (ix < 0 || ix >= BoardSize)
+                                    {
+                                        continue;
+                                    }
+
+                                    float inputValue = tensor[TensorIndex(c, iy, ix)];
+                                    float weight = convW[ConvWIndex(f, c, ky, kx)];
+                                    sum += inputValue * weight;
+                                }
+                            }
+                        }
+
+                        int idx = FeatureIndex(f, y, x);
+                        convPre[idx] = sum;
+                        convAct[idx] = sum > 0f ? sum : 0f;
+                    }
+                }
+            }
+
+            Array.Copy(outB, output, OutputSize);
+
+            int featureSize = filterCount * BoardArea;
+            for (int i = 0; i < featureSize; i++)
+            {
+                float activation = convAct[i];
+                if (activation == 0f)
+                {
+                    continue;
+                }
+
+                int rowOffset = i * OutputSize;
+                for (int action = 0; action < OutputSize; action++)
+                {
+                    output[action] += activation * outW[rowOffset + action];
+                }
+            }
+        }
+
+        private static void StateToTensor(float[] state, float[] tensor)
+        {
+            float turn = state[BoardArea];
+            float turnPlaneValue = (turn + 1f) * 0.5f;
+
+            for (int idx = 0; idx < BoardArea; idx++)
+            {
+                float v = state[idx];
+                float own = v > 0f ? v : 0f;
+                float opp = v < 0f ? -v : 0f;
+                float empty = 1f - Math.Clamp(MathF.Abs(v), 0f, 1f);
+
+                tensor[TensorIndex(0, idx)] = own;
+                tensor[TensorIndex(1, idx)] = opp;
+                tensor[TensorIndex(2, idx)] = empty;
+                tensor[TensorIndex(3, idx)] = turnPlaneValue;
+            }
         }
 
         private void InitializeWeights(Random random)
         {
-            float w1Scale = MathF.Sqrt(2f / InputSize);
-            float w2Scale = MathF.Sqrt(2f / hiddenSize);
+            float convScale = MathF.Sqrt(2f / (InputChannels * KernelSize * KernelSize));
+            float outScale = MathF.Sqrt(2f / (filterCount * BoardArea));
 
-            for (int i = 0; i < w1.Length; i++)
+            for (int i = 0; i < convW.Length; i++)
             {
-                w1[i] = NextUniform(random, -w1Scale, w1Scale);
+                convW[i] = NextUniform(random, -convScale, convScale);
             }
 
-            for (int i = 0; i < w2.Length; i++)
+            for (int i = 0; i < outW.Length; i++)
             {
-                w2[i] = NextUniform(random, -w2Scale, w2Scale);
+                outW[i] = NextUniform(random, -outScale, outScale);
             }
         }
 
@@ -279,32 +416,6 @@ namespace DQN
             return (float)stdNormal;
         }
 
-        private void Forward(float[] input, float[] hiddenPre, float[] hiddenAct, float[] output)
-        {
-            for (int h = 0; h < hiddenSize; h++)
-            {
-                float sum = b1[h];
-                for (int i = 0; i < InputSize; i++)
-                {
-                    sum += input[i] * w1[W1Index(i, h)];
-                }
-
-                hiddenPre[h] = sum;
-                hiddenAct[h] = sum > 0f ? sum : 0f;
-            }
-
-            for (int o = 0; o < OutputSize; o++)
-            {
-                float sum = b2[o];
-                for (int h = 0; h < hiddenSize; h++)
-                {
-                    sum += hiddenAct[h] * w2[W2Index(h, o)];
-                }
-
-                output[o] = sum;
-            }
-        }
-
         private static void ValidateState(float[] state)
         {
             if (state.Length != InputSize)
@@ -313,23 +424,39 @@ namespace DQN
             }
         }
 
-        private int W1Index(int input, int hidden)
+        private static int TensorIndex(int channel, int y, int x)
         {
-            return input * hiddenSize + hidden;
+            return (channel * BoardArea) + (y * BoardSize + x);
         }
 
-        private int W2Index(int hidden, int output)
+        private static int TensorIndex(int channel, int flatIndex)
         {
-            return hidden * OutputSize + output;
+            return channel * BoardArea + flatIndex;
+        }
+
+        private static int FeatureIndex(int filter, int y, int x)
+        {
+            return (filter * BoardArea) + (y * BoardSize + x);
+        }
+
+        private static int ConvWIndex(int filter, int channel, int ky, int kx)
+        {
+            return (((filter * InputChannels + channel) * KernelSize + ky) * KernelSize) + kx;
+        }
+
+        private static int OutWIndex(int featureIndex, int action)
+        {
+            return featureIndex * OutputSize + action;
         }
 
         private sealed class DqnSnapshot
         {
-            public int HiddenSize { get; set; }
-            public float[]? W1 { get; set; }
-            public float[]? B1 { get; set; }
-            public float[]? W2 { get; set; }
-            public float[]? B2 { get; set; }
+            public int Version { get; set; }
+            public int FilterCount { get; set; }
+            public float[]? ConvW { get; set; }
+            public float[]? ConvB { get; set; }
+            public float[]? OutW { get; set; }
+            public float[]? OutB { get; set; }
         }
     }
 }
