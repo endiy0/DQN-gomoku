@@ -1,0 +1,32 @@
+# Visual Studio / IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# .NET SDK local cache
+.dotnet/
+
+# Build output
+**/[Bb]in/
+**/[Oo]bj/
+**/[Dd]ebug/
+**/[Rr]elease/
+**/[Tt]est[Rr]esults/
+artifacts/
+
+# NuGet packages
+*.nupkg
+*.snupkg
+packages/
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# App/runtime generated files
+**/models/
