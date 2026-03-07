@@ -77,8 +77,6 @@ namespace DQN
             statusLabel.BackColor = Color.Transparent;
             Controls.Add(statusLabel);
 
-            button1.Text = "학습";
-            button2.Text = "대국";
             button1.Click += TrainButton_Click;
             button2.Click += GameButton_Click;
         }
