@@ -14,20 +14,24 @@ namespace DQN
         private readonly OmokEnvironment environment = new();
         private readonly Label statusLabel = new();
         private readonly object modelLock = new();
+        private readonly object saveQueueLock = new();
         private readonly Random random = new();
         private readonly string modelDirectory = Path.Combine(AppContext.BaseDirectory, "models");
         private readonly string latestModelPath;
 
         private CancellationTokenSource? trainingCts;
         private Task? trainingTask;
+        private Task? saveWorkerTask;
         private DQN? championModel;
+        private DQN? queuedSaveModel;
+        private bool saveWorkerRunning;
         private bool isTraining;
         private bool aiThinking;
         private StoneColor[,]? trainingRenderBoard;
         private int? trainingRenderLastAction;
 
         private PlayMode playMode = PlayMode.LocalTwoPlayer;
-        private readonly List<GameExperience> aiGameExperiences = [];
+        private readonly List<GameExperience> gameExperiences = [];
 
         public OmokEnvironment Environment => environment;
 
@@ -39,7 +43,7 @@ namespace DQN
         }
 
         private readonly record struct TrainingResult(StoneColor Winner, int MoveCount);
-        private readonly record struct GameExperience(float[] State, int ActionIndex);
+        private readonly record struct GameExperience(float[] State, int ActionIndex, StoneColor Player);
         private readonly record struct TrainingMove(float[] State, int ActionIndex, StoneColor Player);
 
         public Form1()
@@ -52,7 +56,7 @@ namespace DQN
                 BoardLeft + BoardRight + CellSize * (BoardSize - 1),
                 BoardTop + BoardBottom + CellSize * (BoardSize - 1));
             BackColor = Color.BurlyWood;
-            Text = "오목";
+            Text = "오목 DQN";
             DoubleBuffered = true;
             KeyPreview = true;
 
@@ -73,8 +77,8 @@ namespace DQN
             statusLabel.BackColor = Color.Transparent;
             Controls.Add(statusLabel);
 
-            button1.Text = "train";
-            button2.Text = "game";
+            button1.Text = "학습";
+            button2.Text = "대국";
             button1.Click += TrainButton_Click;
             button2.Click += GameButton_Click;
         }
@@ -89,11 +93,11 @@ namespace DQN
                 }
 
                 championModel = DQN.Load(latestModelPath);
-                UpdateStatus("저장된 우승 모델을 로드했습니다.");
+                UpdateStatus("디스크에서 최신 모델을 불러왔습니다.");
             }
             catch (Exception ex)
             {
-                UpdateStatus($"모델 로드 실패: {ex.Message}");
+                UpdateStatus($"모델을 불러오지 못했습니다: {ex.Message}");
             }
         }
 
@@ -101,7 +105,7 @@ namespace DQN
         {
             environment.Reset();
             aiThinking = false;
-            aiGameExperiences.Clear();
+            gameExperiences.Clear();
             if (playMode != PlayMode.Training)
             {
                 ClearTrainingRender();
@@ -119,13 +123,13 @@ namespace DQN
 
             if (playMode == PlayMode.PlayerVsAi)
             {
-                UpdateStatus("게임 모드에서는 무르기를 지원하지 않습니다.");
+                UpdateStatus("플레이어 대 AI 모드에서는 무르기를 사용할 수 없습니다.");
                 return;
             }
 
             if (!environment.UndoLastAction())
             {
-                UpdateStatus("무를 수 있는 착수가 없습니다.");
+                UpdateStatus("무를 수 있는 수가 없습니다.");
                 return;
             }
 
@@ -135,17 +139,17 @@ namespace DQN
 
         private void UpdateStatus(string message)
         {
-            statusLabel.Text = $"{message}  (R: 새 게임, Backspace: 한 수 무르기)";
+            statusLabel.Text = $"{message}  (R: 다시 시작, Backspace: 무르기)";
         }
 
         private void UpdateStatusByMode()
         {
             string modeText = playMode switch
             {
-                PlayMode.LocalTwoPlayer => "로컬 2인 모드",
-                PlayMode.PlayerVsAi => "게임 모드(플레이어 흑 / AI 백)",
+                PlayMode.LocalTwoPlayer => "로컬 2인 대전",
+                PlayMode.PlayerVsAi => "대국 모드 (플레이어: 흑 / AI: 백)",
                 PlayMode.Training => "학습 모드",
-                _ => "모드 없음"
+                _ => "알 수 없는 모드"
             };
 
             UpdateStatus($"{modeText} - {environment.GetStatusText()}");
@@ -265,13 +269,13 @@ namespace DQN
 
             if (playMode == PlayMode.Training)
             {
-                UpdateStatus("학습 중에는 수동 착수를 할 수 없습니다.");
+                UpdateStatus("학습 중에는 돌을 놓을 수 없습니다.");
                 return;
             }
 
             if (aiThinking)
             {
-                UpdateStatus("AI가 수를 두는 중입니다.");
+                UpdateStatus("AI가 수를 계산 중입니다.");
                 return;
             }
 
@@ -286,10 +290,21 @@ namespace DQN
                 return;
             }
 
+            float[]? playerState = null;
+            if (playMode == PlayMode.PlayerVsAi)
+            {
+                playerState = environment.GetTurnAwareObservation();
+            }
+
             if (!environment.TryStepAt(x, y, out OmokStepResult step))
             {
                 UpdateStatus(step.Message);
                 return;
+            }
+
+            if (playMode == PlayMode.PlayerVsAi && playerState is not null)
+            {
+                gameExperiences.Add(new GameExperience((float[])playerState.Clone(), step.ActionIndex, StoneColor.Black));
             }
 
             HandleStepResult(step, showDialog: true);
@@ -316,21 +331,21 @@ namespace DQN
 
             if (step.Winner == StoneColor.None)
             {
-                UpdateStatus("무승부입니다. 새 게임을 시작해주세요.");
+                UpdateStatus("무승부입니다. R 키로 새 게임을 시작하세요.");
                 Invalidate();
                 if (showDialog)
                 {
-                    MessageBox.Show("무승부입니다.", "게임 종료", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    MessageBox.Show("무승부입니다.", "대국 결과", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 return;
             }
 
             string winner = OmokEnvironment.GetStoneName(step.Winner);
-            UpdateStatus($"{winner} 승리! 새 게임을 시작해주세요.");
+            UpdateStatus($"{winner} 승리! R 키로 새 게임을 시작하세요.");
             Invalidate();
             if (showDialog)
             {
-                MessageBox.Show($"{winner}이(가) 이겼습니다.", "게임 종료", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"{winner} 승리입니다.", "대국 결과", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }
 
@@ -363,7 +378,7 @@ namespace DQN
                     ? legalActions[random.Next(legalActions.Count)]
                     : model.SelectAction(aiState, legalActions, epsilon: 0f, random);
 
-                aiGameExperiences.Add(new GameExperience((float[])aiState.Clone(), action));
+                gameExperiences.Add(new GameExperience((float[])aiState.Clone(), action, StoneColor.White));
 
                 OmokStepResult aiStep = environment.StepByAction(action);
                 HandleStepResult(aiStep, showDialog: true);
@@ -402,14 +417,14 @@ namespace DQN
 
             playMode = PlayMode.Training;
             isTraining = true;
-            button1.Text = "stop";
+            button1.Text = "중지";
             button2.Enabled = false;
             ClearTrainingRender();
 
             trainingCts = new CancellationTokenSource();
             trainingTask = Task.Run(() => RunTrainingLoopAsync(trainingCts.Token));
 
-            UpdateStatus("학습 시작: 모델 2개 self-play 진행 중...");
+            UpdateStatus("학습 시작: 두 모델이 self-play를 진행합니다.");
             await Task.CompletedTask;
         }
 
@@ -433,7 +448,7 @@ namespace DQN
                 }
                 catch (Exception ex)
                 {
-                    UpdateStatus($"학습 루프 오류: {ex.Message}");
+                    UpdateStatus($"학습 중 오류가 발생했습니다: {ex.Message}");
                 }
             }
 
@@ -442,18 +457,18 @@ namespace DQN
             trainingTask = null;
             isTraining = false;
 
-            button1.Text = "train";
+            button1.Text = "학습";
             button2.Enabled = true;
             playMode = PlayMode.LocalTwoPlayer;
             ClearTrainingRender();
             Invalidate();
-            UpdateStatus("학습을 정지했습니다. game 버튼을 누르면 AI 대전 모드로 전환됩니다.");
+            UpdateStatus("학습을 중지했습니다. 대국 버튼으로 플레이어 대 AI 모드를 시작할 수 있습니다.");
         }
 
         private async Task RunTrainingLoopAsync(CancellationToken token)
         {
             Directory.CreateDirectory(modelDirectory);
-            aiGameExperiences.Clear();
+            gameExperiences.Clear();
             long lastFrameTick = System.Environment.TickCount64;
 
             var loopRandom = new Random(Guid.NewGuid().GetHashCode());
@@ -482,7 +497,7 @@ namespace DQN
                 }
                 catch (Exception ex)
                 {
-                    SetStatusThreadSafe($"학습 예외 발생: {ex.Message}");
+                    SetStatusThreadSafe($"학습 루프 오류: {ex.Message}");
                     await Task.Delay(50, token);
                     continue;
                 }
@@ -501,7 +516,10 @@ namespace DQN
                 }
 
                 DQN winnerModel = PickWinnerModel(modelA, modelB, result.Winner, loopRandom);
-                SaveLatestModel(winnerModel);
+                if (gameCount == 1 || gameCount % 10 == 0)
+                {
+                    EnqueueLatestModelSave(winnerModel);
+                }
 
                 lock (modelLock)
                 {
@@ -519,9 +537,9 @@ namespace DQN
 
                 string winnerText = result.Winner switch
                 {
-                    StoneColor.Black => "흑 모델",
-                    StoneColor.White => "백 모델",
-                    _ => "무승부(랜덤 선택)"
+                    StoneColor.Black => "흑 승",
+                    StoneColor.White => "백 승",
+                    _ => "무승부(무작위 선택)"
                 };
 
                 SetStatusThreadSafe(
@@ -547,7 +565,7 @@ namespace DQN
             env.Reset();
             PublishTrainingFrame(env.GetBoardCopy(), env.LastActionIndex);
 
-            float epsilon = MathF.Max(0.05f, 0.35f - gameCount * 0.0002f);
+            float epsilon = MathF.Max(0.05f, 0.35f - gameCount * 0.02f); //0.0002f
             int moveCount = 0;
             var episodeMoves = new List<TrainingMove>(OmokEnvironment.ActionCount);
 
@@ -590,7 +608,7 @@ namespace DQN
 
                 moveCount++;
                 long now = System.Environment.TickCount64;
-                if (now - lastFrameTick >= 60 || step.IsGameOver)
+                if (now - lastFrameTick >= 150 || step.IsGameOver)
                 {
                     lastFrameTick = now;
                     PublishTrainingFrame(env.GetBoardCopy(), env.LastActionIndex);
@@ -646,32 +664,77 @@ namespace DQN
             model.Save(latestModelPath);
         }
 
+        private void EnqueueLatestModelSave(DQN model)
+        {
+            lock (saveQueueLock)
+            {
+                queuedSaveModel = model.Clone();
+                if (saveWorkerRunning)
+                {
+                    return;
+                }
+
+                saveWorkerRunning = true;
+                saveWorkerTask = Task.Run(ProcessSaveQueueAsync);
+            }
+        }
+
+        private async Task ProcessSaveQueueAsync()
+        {
+            while (true)
+            {
+                DQN? modelToSave;
+                lock (saveQueueLock)
+                {
+                    modelToSave = queuedSaveModel;
+                    queuedSaveModel = null;
+
+                    if (modelToSave is null)
+                    {
+                        saveWorkerRunning = false;
+                        return;
+                    }
+                }
+
+                try
+                {
+                    SaveLatestModel(modelToSave);
+                }
+                catch (Exception ex)
+                {
+                    SetStatusThreadSafe($"모델 저장 실패: {ex.Message}");
+                }
+
+                await Task.Yield();
+            }
+        }
+
         private void TrainChampionFromPlayerGame(StoneColor winner)
         {
-            if (aiGameExperiences.Count == 0)
+            if (gameExperiences.Count == 0)
             {
                 return;
             }
 
-            float finalReward = winner switch
-            {
-                StoneColor.White => 1f,
-                StoneColor.Black => -1f,
-                _ => 0.2f
-            };
-
             try
             {
+                DQN? modelToSave = null;
                 lock (modelLock)
                 {
                     championModel ??= new DQN(seed: random.Next());
-                    int total = aiGameExperiences.Count;
+                    int total = gameExperiences.Count;
 
                     for (int i = 0; i < total; i++)
                     {
-                        GameExperience exp = aiGameExperiences[i];
+                        GameExperience exp = gameExperiences[i];
                         int remaining = total - 1 - i;
-                        float reward = finalReward * MathF.Pow(0.98f, remaining);
+                        float terminalReward = winner switch
+                        {
+                            StoneColor.None => 0.2f,
+                            _ when winner == exp.Player => 1f,
+                            _ => -1f
+                        };
+                        float reward = terminalReward * MathF.Pow(0.98f, remaining);
 
                         championModel.Train(
                             exp.State,
@@ -684,16 +747,21 @@ namespace DQN
                             learningRate: 0.001f);
                     }
 
-                    SaveLatestModel(championModel);
+                    modelToSave = championModel.Clone();
+                }
+
+                if (modelToSave is not null)
+                {
+                    EnqueueLatestModelSave(modelToSave);
                 }
             }
             catch (Exception ex)
             {
-                UpdateStatus($"게임 결과 학습 실패: {ex.Message}");
+                UpdateStatus($"플레이어 대국 학습 오류: {ex.Message}");
             }
             finally
             {
-                aiGameExperiences.Clear();
+                gameExperiences.Clear();
             }
         }
 
@@ -742,7 +810,7 @@ namespace DQN
 
             playMode = PlayMode.PlayerVsAi;
             StartNewGame();
-            UpdateStatus("게임 모드 시작: 플레이어는 흑돌, AI는 백돌입니다.");
+            UpdateStatus("대국 모드: 플레이어는 흑돌, AI는 백돌입니다.");
         }
 
         private void Form1_KeyDown(object? sender, KeyEventArgs e)
@@ -769,6 +837,14 @@ namespace DQN
             try
             {
                 trainingTask?.Wait(2000);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                saveWorkerTask?.Wait(2000);
             }
             catch
             {
