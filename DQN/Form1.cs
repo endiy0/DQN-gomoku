@@ -563,7 +563,7 @@ namespace DQN
             env.Reset();
             PublishTrainingFrame(env.GetBoardCopy(), env.LastActionIndex);
 
-            float epsilon = MathF.Max(0.05f, 0.35f - gameCount * 0.02f); //0.0002f
+            float epsilon = MathF.Max(0.05f, 0.35f - gameCount * 0.0002f); //0.0002f
             int moveCount = 0;
             var episodeMoves = new List<TrainingMove>(OmokEnvironment.ActionCount);
 
